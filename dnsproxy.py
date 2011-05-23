@@ -2,17 +2,14 @@
 
 # http://tools.ietf.org/html/rfc1035
 
-import socket,sys,struct,getopt,threading, re
+import socket,sys,struct,getopt,threading, re, fnmatch
 try:
     from termcolor import colored
     color_enabled = True
 except:
     color_enabled = False
 
-LINE='-------------------------'
-
-
-options = {'verbose'    : False
+options = {'verbose'    : 1
           ,'multithread': True
           ,'cache'      : False
           ,'dns_server' : '8.8.8.8'
@@ -42,6 +39,8 @@ QCLASS = {1  : 'IN'
          }
 
 def warn(s):
+    if options['verbose'] < 1:
+        return
     s = '[ WW ] ' + s
     if color_enabled:
         print colored(s, 'yellow')
@@ -56,6 +55,8 @@ def err(s) :
         print s
 
 def info(s):
+    if options['verbose'] < 1:
+        return
     s = '[ II ] ' + s
     if color_enabled:
         print colored(s, 'green')
@@ -73,7 +74,6 @@ def chr4o(ch):
 
 def o(data):
     """ for debug output """
-    print ''
     hary = map(hex, map(ord, data))
     bary = map(bin, map(ord, data))
     l = len(hary)
@@ -96,21 +96,51 @@ class myThread(threading.Thread):  # each query would be assigned a new thread t
 class DNSResolve:
     def __init__(self, querydata):
         self.data = querydata
-        if options['verbose']:
-            print LINE+'query:'
+        if options['verbose'] >= 3:
+            print ''
+            info('query packet octet')
             o(querydata)
 
     def reply(self):
-        ret=''
-        key=self.data[2:]
-        packet = self.send_req_udp(self.data)
-        if not packet or len(packet) <= 0:
-            packet = self.send_req_tcp(self.data)
-        ret = packet
-        if options['verbose']:
-            print LINE+'reply:'
+        query = self.parse_query(self.data)
+        ret = ''
+        if query:
+            ret = self.filter_by_rule(self.data)
+        if not ret or len(ret) <= 0:
+            ret = self.send_req_udp(self.data)
+        if not ret or len(ret) <= 0:
+            ret = self.send_req_tcp(self.data)
+        if options['verbose'] >= 3:
+            print ''
+            info('response packet octet')
             o(ret)
         return ret
+
+    def parse_query(self, q):
+        if len(q) < 12:
+            return None
+        qdcount = twobyte2short(q[4:6])
+        if qdcount - 1:
+            return None
+        pos = 12
+        qlen = ord(q[pos])
+        query = ''
+        while qlen > 0:
+            query += q[pos+1 : pos+1+qlen] + '.'
+            pos  += 1 + qlen
+            qlen = ord(q[pos])
+        pos += 1
+        rt = twobyte2short(q[pos:pos+2])
+        if rt - 1:
+            return None
+        pos += 2
+        qc = twobyte2short(q[pos:pos+2])
+        pos += 2
+        if qc - 1:
+            return None
+        query = query.lower()
+        info('query: "%s"' % query)
+        return query[:-1]
     
     def filter_by_rule(self, q):
         if len(q) < 12:
@@ -134,15 +164,20 @@ class DNSResolve:
         pos += 2
         if qc - 1:
             return None
-       
+        query = query.lower()
         local_key = ''
         for domain in localrule.keys():
-            if re.match(domain, query[:-1]):
+            try:
+                rs = re.match(domain, query[:-1])
+            except:
+                rs = None
+            if rs:
                 local_key = domain
                 break
-        if not len(local_key):
+        if not local_key:
             return None
-
+        
+        info('query %s match localrule, return %s' % (query, localrule[local_key]))
         q2 = ord(q[2])
         q2 |= 0x80
         q2 &= 0x06
@@ -152,6 +187,15 @@ class DNSResolve:
         reply += struct.pack('H', 0) # nscount
         reply += struct.pack('H', 0) # arcount
         reply += q[12:pos]
+        reply += struct.pack('B', 0xc0) + struct.pack('B', 0xc)
+        reply += struct.pack('!H', 1)   # QTYPE
+        reply += struct.pack('!H', 1)   # QCLASS
+        reply += struct.pack('!I', 0)   # TTL
+        reply += struct.pack('!H', 4)   # IP length
+        ary = map(int, localrule[local_key].split('.'))
+        for i in range(4):
+            reply += struct.pack('B', ary[i])
+        return reply
     
     def send_req_udp(self, pkt, host = options['dns_server'], port = 53):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -183,7 +227,8 @@ def twobyte2short(twobyte):
     return (t[0] << 8) + t[1]
 
 def showQuery(addr,q):
-    print LINE+'query comes:\n '
+    print ''
+    info('query analysis')
     print 'from',addr,'%s bytes' % str(len(q))
     print 'ID=%s'%str(twobyte2short(q[:2]))
     q2=ord(q[2])
@@ -224,7 +269,7 @@ def main():
         while 1:
             data, addr = server.recvfrom(options['block_size'])
             rsver = DNSResolve(data)
-            if options['verbose']:
+            if options['verbose'] >= 2:
                 showQuery(addr,data)
             if options['multithread']:
                 myThread(server,rsver,addr).start()   # use multi threading to send reply back
@@ -249,14 +294,17 @@ def parseConf(file):
         return
     for i in f:
         line = i.strip()
-        if len(line) > 0 and not line.startswith('#') and not line.startswith(';'):
+        idx = line.find('#')
+        if idx > -1:
+            line = line[:idx]
+        if line:
             if line.find('=') > 0:
                 (name, _, value) = line.partition('=')
                 name = name.strip()
                 value = value.strip()
-                if name in ('port', 'timeout', 'block_size'):
+                if name in ('port', 'timeout', 'block_size', 'verbose'):
                     options[name] = int(value)
-                elif name in ('verbose', 'cache', 'multithread'):
+                elif name in ('cache', 'multithread'):
                     options[name] = value.lower() == 'true'
                 else:
                     options[name] = value
@@ -264,7 +312,11 @@ def parseConf(file):
                 ary = line.split()
                 if ary[0].lower() == 'localrule':
                     if len(ary) > 2:
-                        localrule[ary[2]] = ary[1]
+                        ary[2] = ary[2].lower()
+                        if len(ary) > 3 and ary[3].lower() == 're':
+                            localrule[ary[2]] = ary[1]
+                        else:
+                            localrule[fnmatch.translate(ary[2])] = ary[1]
                     else:
                         warn('invalid localrule: "%s"' % line)
     f.close()
@@ -273,8 +325,10 @@ if __name__=='__main__':
     print ''
     parseOpt(sys.argv[1:])
     parseConf(options['conf_file'])
-    if options['verbose']:
+    if options['verbose'] >= 2:
+        info('options')
         print options
+        info('local rules')
         print localrule
     main()
 
