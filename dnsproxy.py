@@ -2,7 +2,7 @@
 
 # http://tools.ietf.org/html/rfc1035
 
-import socket,sys,struct,getopt,threading
+import socket,sys,struct,getopt,threading, re
 try:
     from termcolor import colored
     color_enabled = True
@@ -103,18 +103,68 @@ class DNSResolve:
     def reply(self):
         ret=''
         key=self.data[2:]
-        if options['cache'] and cache.has_key(key):
-            ret = self.data[:2] + cache[key]
-        else:
+        packet = self.send_req_udp(self.data)
+        if not packet or len(packet) <= 0:
             packet = self.send_req_tcp(self.data)
-            cache[key] = packet[2:]
-            ret = packet
+        ret = packet
         if options['verbose']:
             print LINE+'reply:'
             o(ret)
         return ret
+    
+    def filter_by_rule(self, q):
+        if len(q) < 12:
+            return None
+        qdcount = twobyte2short(q[4:6])
+        if qdcount - 1:
+            return None
+        pos = 12
+        qlen = ord(q[pos])
+        query = ''
+        while qlen > 0:
+            query += q[pos+1 : pos+1+qlen] + '.'
+            pos  += 1 + qlen
+            qlen = ord(q[pos])
+        pos += 1
+        rt = twobyte2short(q[pos:pos+2])
+        if rt - 1:
+            return None
+        pos += 2
+        qc = twobyte2short(q[pos:pos+2])
+        pos += 2
+        if qc - 1:
+            return None
+       
+        local_key = ''
+        for domain in localrule.keys():
+            if re.match(domain, query[:-1]):
+                local_key = domain
+                break
+        if not len(local_key):
+            return None
 
-    def send_req_tcp(self, pkt, host = options['dns_server'], port = options['port']):
+        q2 = ord(q[2])
+        q2 |= 0x80
+        q2 &= 0x06
+        reply  = q[:2] + struct.pack('B', q2) + struct.pack('B', 0)
+        reply += q[4:6]     # rqcount
+        reply += q[4:6]     # ancount
+        reply += struct.pack('H', 0) # nscount
+        reply += struct.pack('H', 0) # arcount
+        reply += q[12:pos]
+    
+    def send_req_udp(self, pkt, host = options['dns_server'], port = 53):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ret = None
+        try:
+            s.sendto(pkt, (host, port))
+            ret, addr = s.recvfrom(options['block_size'])
+        except:
+            pass
+        s.close()
+        return ret
+
+    def send_req_tcp(self, pkt, host = options['dns_server'], port = 53):
         pkt = struct.pack("!H", len(pkt)) + pkt      # network(big-endian), unsigned short, RFC 1035 4.2.2
                                                 # should it be len(pkt)+2
         s = socket.socket(socket.AF_INET,socket.SOCK_STREAM)  # TCP 
@@ -139,10 +189,10 @@ def showQuery(addr,q):
     q2=ord(q[2])
     q3=ord(q[3])
     print 'QR=%d, Opcode=%d, AA=%d, TC=%d, RD=%d, RA=%d, Z=%d, RCODE=%d'%(q2&0x80,q2&0x74,q2&0x04,q2&0x02,q2&1,q3&0x80,q3&0x70,q3&0x0f)
-    qdcount=twobyte2short(q[4:6])
-    ancount=twobyte2short(q[6:8])
-    nscount=twobyte2short(q[8:10])
-    arcount=twobyte2short(q[10:12])
+    qdcount = twobyte2short(q[4:6])
+    ancount = twobyte2short(q[6:8])
+    nscount = twobyte2short(q[8:10])
+    arcount = twobyte2short(q[10:12])
     print 'QDCOUNT=%d, ANCOUNT=%d, NSCOUNT=%d, ARCOUNT=%d\n'%(qdcount,ancount,nscount,arcount)
     print 'questions:'
     ret=''
